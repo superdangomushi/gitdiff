@@ -69,7 +69,8 @@ def check_ref(ref: str) -> bool:
 
 
 def get_diff_files(branch_a: str, branch_b: str) -> tuple[list[tuple[str, str]], Optional[str]]:
-    stdout, stderr, rc = run_git("diff", "--name-status", f"{branch_a}...{branch_b}")
+    ref = [f"{branch_a}...{branch_b}"] if branch_b else [branch_a]
+    stdout, stderr, rc = run_git("diff", "--name-status", *ref)
     if rc != 0:
         return [], stderr.strip()
     files: list[tuple[str, str]] = []
@@ -84,7 +85,8 @@ def get_diff_files(branch_a: str, branch_b: str) -> tuple[list[tuple[str, str]],
 
 
 def get_file_stats(branch_a: str, branch_b: str) -> dict[str, tuple[str, str]]:
-    stdout, _, _ = run_git("diff", "--numstat", f"{branch_a}...{branch_b}")
+    ref = [f"{branch_a}...{branch_b}"] if branch_b else [branch_a]
+    stdout, _, _ = run_git("diff", "--numstat", *ref)
     stats: dict[str, tuple[str, str]] = {}
     for line in stdout.strip().split("\n"):
         if not line:
@@ -97,7 +99,8 @@ def get_file_stats(branch_a: str, branch_b: str) -> dict[str, tuple[str, str]]:
 
 
 def get_file_diff(branch_a: str, branch_b: str, filename: str) -> str:
-    stdout, _, _ = run_git("diff", f"{branch_a}...{branch_b}", "--", filename)
+    ref = [f"{branch_a}...{branch_b}"] if branch_b else [branch_a]
+    stdout, _, _ = run_git("diff", *ref, "--", filename)
     return stdout
 
 
@@ -189,6 +192,17 @@ class DiffTextArea(TextArea):
         self._added_lines = added
         self._deleted_lines = deleted
         self.refresh()
+
+    def on_key(self, event) -> None:
+        """Capture Tab for indentation and Escape to exit edit mode."""
+        if event.key == "tab":
+            event.stop()
+            event.prevent_default()
+            self.insert("\t")
+        elif event.key == "escape":
+            event.stop()
+            event.prevent_default()
+            self.app.action_exit_edit()
 
     def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
@@ -397,6 +411,7 @@ class GitDiffApp(App):
         Binding("ctrl+p", "toggle_editor",   "Editor Panel", priority=True),
         Binding("ctrl+s", "write_out",       "Write Out",    priority=True),
         Binding("ctrl+x", "revert_file",     "Revert",       priority=True),
+        Binding("escape", "exit_edit",        "Exit Edit",    priority=True),
         Binding("ctrl+g", "focus_list",      "File List",    priority=True),
     ]
 
@@ -409,6 +424,10 @@ class GitDiffApp(App):
         self._current_index: int = 0
         self._repo_root: Optional[str] = get_repo_root()
         self._show_deleted: bool = True
+
+    @property
+    def _b_label(self) -> str:
+        return self.branch_b if self.branch_b else "Working Tree"
         self._show_editor: bool = True
         self._diff_lines: list[tuple[str, str, Optional[int]]] = []
 
@@ -423,7 +442,7 @@ class GitDiffApp(App):
                 ]
                 yield ListView(*items, id="file-list")
             with Vertical(id="diff-panel"):
-                yield Static(f" {self.branch_a}  →  {self.branch_b}", id="diff-title")
+                yield Static(f" {self.branch_a}  →  {self._b_label}", id="diff-title")
                 with ScrollableContainer(id="diff-scroll"):
                     yield Static("← Select a file", id="diff-content")
             with Vertical(id="editor-panel"):
@@ -434,7 +453,7 @@ class GitDiffApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = f"gitdiff  {self.branch_a} → {self.branch_b}"
+        self.title = f"gitdiff  {self.branch_a} → {self._b_label}"
         self.query_one("#file-list", ListView).focus()
         if self.files:
             self._load_file(0)
@@ -455,6 +474,10 @@ class GitDiffApp(App):
 
     def action_page_up(self) -> None:
         self.query_one("#diff-scroll", ScrollableContainer).scroll_page_up()
+
+    def action_exit_edit(self) -> None:
+        if self.query_one("#editor").display:
+            self._exit_edit_mode()
 
     def action_focus_list(self) -> None:
         self._exit_edit_mode()
@@ -529,7 +552,7 @@ class GitDiffApp(App):
             if not check_ref(new_a):
                 self.notify(f"'{new_a}' is not a valid branch or ref.", severity="error")
                 return
-            if not check_ref(new_b):
+            if new_b and not check_ref(new_b):
                 self.notify(f"'{new_b}' is not a valid branch or ref.", severity="error")
                 return
             files, error = get_diff_files(new_a, new_b)
@@ -617,7 +640,7 @@ class GitDiffApp(App):
         self.query_one("#editor-title", Static).update(title)
 
     def _reload_file_list(self) -> None:
-        self.title = f"gitdiff  {self.branch_a} → {self.branch_b}"
+        self.title = f"gitdiff  {self.branch_a} → {self._b_label}"
         self.query_one("#sidebar-title", Static).update(f" Files ({len(self.files)})")
 
         list_view = self.query_one("#file-list", ListView)
@@ -633,7 +656,7 @@ class GitDiffApp(App):
             self.query_one("#diff-content", Static).update(
                 "[dim]No differences between the selected branches.[/dim]"
             )
-            self.query_one("#diff-title", Static).update(f" {self.branch_a}  →  {self.branch_b}")
+            self.query_one("#diff-title", Static).update(f" {self.branch_a}  →  {self._b_label}")
             self.query_one("#editor-view", Static).update("")
             self.query_one("#editor-title", Static).update(" Editor")
 
@@ -659,7 +682,7 @@ def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: gitdiff <branch-a> [<branch-b>]")
         print()
-        print("  <branch-b> defaults to HEAD when omitted.")
+        print("  <branch-b> omitted  → compare with working tree (uncommitted changes)")
         print()
         print("  Interactively browse and edit diffs between two branches.")
         print("  j/k      move file list     Ctrl+D/U  scroll diff")
@@ -671,13 +694,14 @@ def main() -> None:
         sys.exit(1)
 
     branch_a = sys.argv[1]
-    branch_b = sys.argv[2] if len(sys.argv) >= 3 else "HEAD"
+    branch_b = sys.argv[2] if len(sys.argv) >= 3 else ""
 
     if not check_git_repo():
         print("Error: not inside a git repository.")
         sys.exit(1)
 
-    for ref in (branch_a, branch_b):
+    refs_to_check = [branch_a] + ([branch_b] if branch_b else [])
+    for ref in refs_to_check:
         if not check_ref(ref):
             print(f"Error: '{ref}' is not a valid branch or ref.")
             sys.exit(1)

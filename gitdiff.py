@@ -589,6 +589,11 @@ class GitDiffApp(App):
             self.query_one("#editor-title", Static).update(" Editor  [dim](deleted)[/dim]")
             return
         diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
+        if not diff_text:
+            self._diff_lines = []
+            self.query_one("#editor-view", Static).update("[dim](no diff available)[/dim]")
+            self.query_one("#editor-title", Static).update(f" Editor  [dim]{filename}[/dim]")
+            return
         self._diff_lines = parse_diff_lines(diff_text)
         self._refresh_editor_view()
         self._update_editor_title()

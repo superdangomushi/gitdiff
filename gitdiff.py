@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """gitdiff - Interactive git branch diff viewer"""
 
+import argparse
 import os
 import re
 import subprocess
@@ -61,6 +62,16 @@ def run_git(*args: str) -> tuple[str, str, int]:
 def check_git_repo() -> bool:
     _, _, rc = run_git("rev-parse", "--git-dir")
     return rc == 0
+
+
+def get_current_branch() -> str:
+    """Return the current branch name, or HEAD hash if detached."""
+    stdout, _, rc = run_git("branch", "--show-current")
+    name = stdout.strip()
+    if rc == 0 and name:
+        return name
+    stdout, _, _ = run_git("rev-parse", "--short", "HEAD")
+    return stdout.strip() or "unknown"
 
 
 def check_ref(ref: str) -> bool:
@@ -424,12 +435,12 @@ class GitDiffApp(App):
         self._current_index: int = 0
         self._repo_root: Optional[str] = get_repo_root()
         self._show_deleted: bool = True
+        self._show_editor: bool = True
+        self._diff_lines: list[tuple[str, str, Optional[int]]] = []
 
     @property
     def _b_label(self) -> str:
         return self.branch_b if self.branch_b else "Working Tree"
-        self._show_editor: bool = True
-        self._diff_lines: list[tuple[str, str, Optional[int]]] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -453,7 +464,7 @@ class GitDiffApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = f"gitdiff  {self.branch_a} → {self._b_label}"
+        self.title = f"gitdiff  {self.branch_a} → {self._b_label}  (on {get_current_branch()})"
         self.query_one("#file-list", ListView).focus()
         if self.files:
             self._load_file(0)
@@ -612,6 +623,11 @@ class GitDiffApp(App):
             self.query_one("#editor-title", Static).update(" Editor  [dim](deleted)[/dim]")
             return
         diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
+        if not diff_text:
+            self._diff_lines = []
+            self.query_one("#editor-view", Static).update("[dim](no diff available)[/dim]")
+            self.query_one("#editor-title", Static).update(f" Editor  [dim]{filename}[/dim]")
+            return
         self._diff_lines = parse_diff_lines(diff_text)
         self._refresh_editor_view()
         self._update_editor_title()
@@ -635,7 +651,7 @@ class GitDiffApp(App):
         self.query_one("#editor-title", Static).update(title)
 
     def _reload_file_list(self) -> None:
-        self.title = f"gitdiff  {self.branch_a} → {self._b_label}"
+        self.title = f"gitdiff  {self.branch_a} → {self._b_label}  (on {get_current_branch()})"
         self.query_one("#sidebar-title", Static).update(f" Files ({len(self.files)})")
 
         list_view = self.query_one("#file-list", ListView)
@@ -673,23 +689,54 @@ class GitDiffApp(App):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: gitdiff <branch-a> [<branch-b>]")
-        print()
-        print("  <branch-b> omitted  → compare with working tree (uncommitted changes)")
-        print()
-        print("  Interactively browse and edit diffs between two branches.")
-        print("  j/k      move file list     Ctrl+D/U  scroll diff")
-        print("  e        enter edit mode    Ctrl+G    back to file list")
-        print("  Ctrl+S   save file          Ctrl+X    revert file")
-        print("  Ctrl+R   toggle deleted     Ctrl+P    toggle editor panel")
-        print("  b        change branches")
-        print("  q        quit")
-        sys.exit(1)
+def _branch_completer(**kwargs):  # noqa: ANN003
+    """Return git branch/tag names for argcomplete."""
+    try:
+        result = subprocess.run(
+            ["git", "branch", "-a", "--format=%(refname:short)"],
+            capture_output=True, text=True, timeout=5,
+        )
+        branches = result.stdout.splitlines()
+        result2 = subprocess.run(
+            ["git", "tag", "--list"],
+            capture_output=True, text=True, timeout=5,
+        )
+        branches += result2.stdout.splitlines()
+        return branches
+    except Exception:
+        return []
 
-    branch_a = sys.argv[1]
-    branch_b = sys.argv[2] if len(sys.argv) >= 3 else ""
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="gitdiff",
+        description="Interactively browse and edit diffs between two branches.",
+        epilog=(
+            "Keys:\n"
+            "  j/k      move file list     Ctrl+D/U  scroll diff\n"
+            "  e        enter edit mode    Ctrl+G    back to file list\n"
+            "  Ctrl+S   save file          Ctrl+X    revert file\n"
+            "  Ctrl+R   toggle deleted     Ctrl+P    toggle editor panel\n"
+            "  b        change branches\n"
+            "  q        quit"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    branch_a_arg = parser.add_argument("branch_a", metavar="branch-a", help="Base branch or ref")
+    branch_b_arg = parser.add_argument("branch_b", metavar="branch-b", nargs="?", default="",
+                                       help="Target branch or ref (omit to compare with working tree)")
+
+    try:
+        import argcomplete
+        branch_a_arg.completer = _branch_completer  # type: ignore[attr-defined]
+        branch_b_arg.completer = _branch_completer  # type: ignore[attr-defined]
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        pass
+
+    args = parser.parse_args()
+    branch_a = args.branch_a
+    branch_b = args.branch_b
 
     if not check_git_repo():
         print("Error: not inside a git repository.")

@@ -2,16 +2,17 @@
 
 Git ブランチ間の差分をターミナル上でインタラクティブに閲覧・編集できる TUI ツールです。
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
-
-## 特徴
+## 概要
 
 - **3ペインレイアウト** — ファイル一覧 / diff ビュー / エディタを一画面で表示
 - **インライン編集** — diff を見ながらその場でファイルを編集・保存
 - **シンタックスハイライト** — 20以上の言語に対応した色付き diff 表示
 - **ステータス表示** — 追加(A)・変更(M)・削除(D)・リネーム(R) などを色分け表示
 - **ブランチ切替** — 比較対象のブランチをその場で変更可能
+- **動作環境** - pythonが必要です。windows環境ならwingetなりでインストールしたら早いかも
+```bash
+winget install python
+```
 
 ## インストール
 

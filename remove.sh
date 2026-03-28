@@ -2,31 +2,20 @@
 set -euo pipefail
 
 INSTALL_DIR="$HOME/.local/bin"
-SCRIPT_NAME="gitdiff"
-VENV_DIR="$HOME/.local/share/gitdiff-venv"
+BINARY_NAME="gitdiff"
 
 echo "=== gitdiff uninstaller ==="
 echo ""
 
 REMOVED=0
 
-# ---- remove wrapper script ----
-DEST="$INSTALL_DIR/$SCRIPT_NAME"
+DEST="$INSTALL_DIR/$BINARY_NAME"
 if [[ -f "$DEST" ]]; then
     rm "$DEST"
     echo "Removed: $DEST"
     REMOVED=1
 else
     echo "Not found (skipping): $DEST"
-fi
-
-# ---- remove virtual environment ----
-if [[ -d "$VENV_DIR" ]]; then
-    rm -rf "$VENV_DIR"
-    echo "Removed: $VENV_DIR"
-    REMOVED=1
-else
-    echo "Not found (skipping): $VENV_DIR"
 fi
 
 echo ""

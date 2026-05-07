@@ -14,8 +14,9 @@ from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual.strip import Strip
 from textual.widgets import (
-    Header, Footer, ListView, ListItem, Label, Static, Input, Button, TextArea
+    Header, Footer, Label, Static, Input, Button, TextArea, Tree
 )
+from textual.widgets.tree import TreeNode
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from rich.segment import Segment
 from rich.style import Style as RichStyle
@@ -231,22 +232,11 @@ class DiffTextArea(TextArea):
         return Strip(new_segs, strip.cell_length)
 
 
-class FileListItem(ListItem):
-    def __init__(self, index: int, status: str, filename: str, stats: tuple[str, str]) -> None:
-        super().__init__()
-        self.file_index = index
-        self.status = status
-        self.filename = filename
-        self.stats = stats
-
-    def compose(self) -> ComposeResult:
-        color, badge, _ = STATUS_STYLES.get(self.status, ("white", "[?]", "Unknown"))
-        added, removed = self.stats
-        if added != "-":
-            stats_str = f"  [green]+{added}[/green] [red]-{removed}[/red]"
-        else:
-            stats_str = ""
-        yield Label(f"[{color}]{badge}[/{color}] {self.filename}{stats_str}")
+def _file_leaf_label(status: str, name: str, stats: tuple[str, str]) -> str:
+    color, badge, _ = STATUS_STYLES.get(status, ("white", "[?]", "Unknown"))
+    added, removed = stats
+    stats_str = f"  [green]+{added}[/green] [red]-{removed}[/red]" if added != "-" else ""
+    return f"[{color}]{badge}[/{color}] {name}{stats_str}"
 
 
 class ChangeBranchScreen(ModalScreen):
@@ -351,9 +341,6 @@ class GitDiffApp(App):
 
     #file-list {
         height: 1fr;
-    }
-
-    ListItem {
         padding: 0 1;
     }
 
@@ -447,11 +434,10 @@ class GitDiffApp(App):
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield Static(f" Files ({len(self.files)})", id="sidebar-title")
-                items = [
-                    FileListItem(i, status, filename, self.file_stats.get(filename, ("-", "-")))
-                    for i, (status, filename) in enumerate(self.files)
-                ]
-                yield ListView(*items, id="file-list")
+                tree: Tree[int] = Tree("Files", id="file-list")
+                tree.show_root = False
+                tree.guide_depth = 2
+                yield tree
             with Vertical(id="diff-panel"):
                 yield Static(f" {self.branch_a}  →  {self._b_label}", id="diff-title")
                 with ScrollableContainer(id="diff-scroll"):
@@ -465,20 +451,26 @@ class GitDiffApp(App):
 
     def on_mount(self) -> None:
         self.title = f"gitdiff  {self.branch_a} → {self._b_label}  (on {get_current_branch()})"
-        self.query_one("#file-list", ListView).focus()
-        if self.files:
-            self._load_file(0)
+        tree = self.query_one("#file-list", Tree)
+        self._build_file_tree(tree)
+        tree.focus()
+        first_leaf = self._first_leaf(tree.root)
+        if first_leaf is not None:
+            tree.move_cursor(first_leaf)
+            self._current_index = first_leaf.data
+            self._load_file(first_leaf.data)
 
-    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.item and isinstance(event.item, FileListItem):
-            self._current_index = event.item.file_index
-            self._load_file(event.item.file_index)
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+        data = event.node.data
+        if isinstance(data, int):
+            self._current_index = data
+            self._load_file(data)
 
     def action_move_down(self) -> None:
-        self.query_one("#file-list", ListView).action_cursor_down()
+        self.query_one("#file-list", Tree).action_cursor_down()
 
     def action_move_up(self) -> None:
-        self.query_one("#file-list", ListView).action_cursor_up()
+        self.query_one("#file-list", Tree).action_cursor_up()
 
     def action_page_down(self) -> None:
         self.query_one("#diff-scroll", ScrollableContainer).scroll_page_down()
@@ -492,7 +484,7 @@ class GitDiffApp(App):
 
     def action_focus_list(self) -> None:
         self._exit_edit_mode()
-        self.query_one("#file-list", ListView).focus()
+        self.query_one("#file-list", Tree).focus()
 
     def action_enter_edit(self) -> None:
         if not self.files:
@@ -511,7 +503,7 @@ class GitDiffApp(App):
             # If hiding while in edit mode, exit edit mode first
             if self.query_one("#editor").display:
                 self._exit_edit_mode()
-            self.query_one("#file-list", ListView).focus()
+            self.query_one("#file-list", Tree).focus()
 
     def action_toggle_deleted(self) -> None:
         self._show_deleted = not self._show_deleted
@@ -581,6 +573,37 @@ class GitDiffApp(App):
         self.push_screen(ChangeBranchScreen(self.branch_a, self.branch_b), on_dismiss)
 
     # ---- internal helpers ----
+
+    def _build_file_tree(self, tree: Tree) -> None:
+        """Populate the Tree widget with files grouped by folder."""
+        tree.clear()
+        tree.root.expand()
+        dir_nodes: dict[tuple[str, ...], TreeNode] = {(): tree.root}
+
+        # Sort by path so siblings group together; keep original index for diff lookup.
+        indexed = sorted(enumerate(self.files), key=lambda x: x[1][1].split("/"))
+
+        for orig_idx, (status, filename) in indexed:
+            parts = filename.split("/")
+            for depth in range(1, len(parts)):
+                key = tuple(parts[:depth])
+                if key not in dir_nodes:
+                    parent = dir_nodes[key[:-1]]
+                    dir_nodes[key] = parent.add(
+                        f"[bold]{parts[depth - 1]}/[/bold]", expand=True
+                    )
+            parent = dir_nodes[tuple(parts[:-1])]
+            stats = self.file_stats.get(filename, ("-", "-"))
+            parent.add_leaf(_file_leaf_label(status, parts[-1], stats), data=orig_idx)
+
+    def _first_leaf(self, node: TreeNode) -> Optional[TreeNode]:
+        if node.allow_expand is False or not node.children:
+            return node if isinstance(node.data, int) else None
+        for child in node.children:
+            found = self._first_leaf(child)
+            if found is not None:
+                return found
+        return None
 
     def _enter_edit_mode(self) -> None:
         if not self.files or self._repo_root is None:
@@ -654,15 +677,14 @@ class GitDiffApp(App):
         self.title = f"gitdiff  {self.branch_a} → {self._b_label}  (on {get_current_branch()})"
         self.query_one("#sidebar-title", Static).update(f" Files ({len(self.files)})")
 
-        list_view = self.query_one("#file-list", ListView)
-        list_view.clear()
-        for i, (status, filename) in enumerate(self.files):
-            list_view.append(
-                FileListItem(i, status, filename, self.file_stats.get(filename, ("-", "-")))
-            )
+        tree = self.query_one("#file-list", Tree)
+        self._build_file_tree(tree)
 
-        if self.files:
-            self._load_file(0)
+        first_leaf = self._first_leaf(tree.root)
+        if first_leaf is not None:
+            tree.move_cursor(first_leaf)
+            self._current_index = first_leaf.data
+            self._load_file(first_leaf.data)
         else:
             self.query_one("#diff-content", Static).update(
                 "[dim]No differences between the selected branches.[/dim]"

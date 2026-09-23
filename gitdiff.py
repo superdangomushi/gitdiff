@@ -129,6 +129,19 @@ def get_repo_root() -> Optional[str]:
 # Diff parsing & rendering
 # ---------------------------------------------------------------------------
 
+def _hunk_new_offset(header: str, default: int) -> int:
+    """Return the number of new-file lines that precede a hunk.
+
+    ``@@ -a,b +c,d @@`` starts at line ``c``, except that an empty new range
+    (``d == 0``) names the line the hunk comes *after*.
+    """
+    m = re.search(r"\+(\d+)(?:,(\d+))?", header)
+    if not m:
+        return default
+    start = int(m.group(1))
+    return start if m.group(2) == "0" else start - 1
+
+
 def parse_diff_lines(diff_text: str) -> list[tuple[str, str, Optional[int]]]:
     """Parse diff text into (kind, content, new_lineno) tuples.
 
@@ -144,9 +157,7 @@ def parse_diff_lines(diff_text: str) -> list[tuple[str, str, Optional[int]]]:
             in_hunk = False
             continue
         if line.startswith("@@"):
-            m = re.search(r"\+(\d+)", line)
-            if m:
-                new_lineno = int(m.group(1)) - 1
+            new_lineno = _hunk_new_offset(line, new_lineno)
             in_hunk = True
             continue
         if not in_hunk or line.startswith("\\"):
@@ -161,6 +172,74 @@ def parse_diff_lines(diff_text: str) -> list[tuple[str, str, Optional[int]]]:
             result.append(("ctx", line[1:], new_lineno))
 
     return result
+
+
+def parse_deleted_lines(diff_text: str) -> list[tuple[int, str]]:
+    """Return (anchor, content) for every deleted line in the diff.
+
+    anchor: how many new-file lines precede the deleted line, i.e. the 0-based
+    index in the new file it would be restored in front of.
+    """
+    result: list[tuple[int, str]] = []
+    new_lineno = 0
+    in_hunk = False
+
+    for line in diff_text.splitlines():
+        if line.startswith(("diff ", "index ", "--- ", "+++ ")):
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            new_lineno = _hunk_new_offset(line, new_lineno)
+            in_hunk = True
+            continue
+        if not in_hunk or line.startswith("\\"):
+            continue
+        if line.startswith("-"):
+            result.append((new_lineno, line[1:]))
+        else:
+            new_lineno += 1
+
+    return result
+
+
+def build_edit_buffer(
+    content: str,
+    diff_text: str,
+) -> tuple[str, set[int], set[int]]:
+    """Interleave the diff's deleted lines into ``content`` for editing.
+
+    Returns (buffer, added, deleted): 0-based buffer line indices of the
+    added lines (green) and of the inserted deleted lines (red).
+    """
+    file_lines = content.split("\n")
+    added_new = {
+        lineno - 1
+        for kind, _content, lineno in parse_diff_lines(diff_text)
+        if kind == "add" and lineno is not None
+    }
+    deletions = parse_deleted_lines(diff_text)
+
+    lines: list[str] = []
+    added: set[int] = set()
+    deleted: set[int] = set()
+    d = 0
+    for i, line in enumerate(file_lines):
+        while d < len(deletions) and deletions[d][0] <= i:
+            deleted.add(len(lines))
+            lines.append(deletions[d][1])
+            d += 1
+        if i in added_new:
+            added.add(len(lines))
+        lines.append(line)
+    # Deletions past the end of the file (e.g. content no longer on disk)
+    # go before the empty string that a trailing newline splits into.
+    tail = len(lines) - 1 if lines and lines[-1] == "" else len(lines)
+    for _anchor, text in deletions[d:]:
+        deleted.add(tail)
+        lines.insert(tail, text)
+        tail += 1
+
+    return "\n".join(lines), added, deleted
 
 
 def build_editor_view(
@@ -226,7 +305,11 @@ def remap_line_indices(
 
 
 class DiffTextArea(TextArea):
-    """TextArea that highlights added/deleted lines with green/red backgrounds."""
+    """TextArea that highlights added/deleted lines with green/red backgrounds.
+
+    Deleted lines are shown inline but are not part of the file: they are
+    read-only, dropped on save, and Backspace on one restores it.
+    """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -249,7 +332,8 @@ class DiffTextArea(TextArea):
         if event.key == "tab":
             event.stop()
             event.prevent_default()
-            self.insert("\t")
+            if not self._touches_deleted(*self.selection):
+                self.insert("\t")
         elif event.key == "escape":
             event.stop()
             event.prevent_default()
@@ -262,6 +346,52 @@ class DiffTextArea(TextArea):
         if self._remap_timer is not None:
             self._remap_timer.stop()
         self._remap_timer = self.set_timer(_REMAP_DEBOUNCE, self._remap_diff_lines)
+
+    def _sync_diff_lines(self) -> None:
+        """Re-anchor the highlights now instead of waiting for the debounce."""
+        if self._remap_timer is not None:
+            self._remap_timer.stop()
+        self._remap_diff_lines()
+
+    def saved_text(self) -> str:
+        """Buffer contents without the (unrestored) deleted lines."""
+        self._sync_diff_lines()
+        return "\n".join(
+            line for i, line in enumerate(self.text.split("\n"))
+            if i not in self._deleted_lines
+        )
+
+    def _touches_deleted(self, start, end) -> bool:
+        if not self._deleted_lines:
+            return False
+        self._sync_diff_lines()
+        top, bottom = sorted((start[0], end[0]))
+        return any(top <= row <= bottom for row in self._deleted_lines)
+
+    def action_delete_left(self) -> None:
+        """Backspace on a deleted (red) line restores it instead of editing."""
+        if self.selection.is_empty and self._deleted_lines:
+            self._sync_diff_lines()
+            row = self.cursor_location[0]
+            if row in self._deleted_lines:
+                self._deleted_lines.discard(row)
+                self.refresh()
+                return
+        super().action_delete_left()
+
+    def _delete_via_keyboard(self, start, end):
+        if self._touches_deleted(start, end):
+            self.notify("Deleted line: press Backspace to restore it first.",
+                        severity="warning")
+            return None
+        return super()._delete_via_keyboard(start, end)
+
+    def _replace_via_keyboard(self, insert, start, end):
+        if self._touches_deleted(start, end):
+            self.notify("Deleted line: press Backspace to restore it first.",
+                        severity="warning")
+            return None
+        return super()._replace_via_keyboard(insert, start, end)
 
     def _remap_diff_lines(self) -> None:
         self._remap_timer = None
@@ -602,14 +732,15 @@ class GitDiffApp(App):
         filepath = os.path.join(self._repo_root, filename)
         editor = self.query_one("#editor", DiffTextArea)
         try:
-            Path(filepath).write_text(editor.text, encoding="utf-8")
+            content = editor.saved_text()
+            Path(filepath).write_text(content, encoding="utf-8")
             self.notify(f"Saved: {filename}")
             # Refresh diff, view, and editor highlights after save
             diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
             self._diff_lines = parse_diff_lines(diff_text)
             self._render_diff(self._current_index)
             self._refresh_editor_view()
-            editor.set_diff_lines(*self._compute_editor_highlights())
+            self._load_editor_buffer(content, diff_text, keep_cursor=True)
         except OSError as e:
             self.notify(f"Error saving: {e}", severity="error")
 
@@ -624,9 +755,8 @@ class GitDiffApp(App):
             content = Path(filepath).read_text(encoding="utf-8")
         except OSError:
             content = ""
-        editor = self.query_one("#editor", DiffTextArea)
-        editor.load_text(content)
-        editor.set_diff_lines(*self._compute_editor_highlights())
+        diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
+        self._load_editor_buffer(content, diff_text)
         self.notify(f"Reverted: {filename}")
 
     def action_change_branch(self) -> None:
@@ -698,21 +828,27 @@ class GitDiffApp(App):
             content = ""
         editor = self.query_one("#editor", DiffTextArea)
         editor.language = get_language(filename)
-        editor.load_text(content)
-        editor.set_diff_lines(*self._compute_editor_highlights())
+        diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
+        self._load_editor_buffer(content, diff_text)
         self.query_one("#editor-view-scroll").display = False
         editor.display = True
         editor.focus()
         self._update_editor_title(edit_mode=True)
 
-    def _compute_editor_highlights(self) -> tuple[set[int], set[int]]:
-        """Return (added_lines, deleted_lines) as 0-based index sets for the editor."""
-        added: set[int] = set()
-        # deleted lines don't exist in the actual file, so nothing to mark
-        for kind, _content, lineno in self._diff_lines:
-            if kind == "add" and lineno is not None:
-                added.add(lineno - 1)  # convert 1-based to 0-based
-        return added, set()
+    def _load_editor_buffer(
+        self, content: str, diff_text: str, keep_cursor: bool = False
+    ) -> None:
+        """Load ``content`` plus the diff's deleted lines into the editor."""
+        editor = self.query_one("#editor", DiffTextArea)
+        buffer, added, deleted = build_edit_buffer(content, diff_text)
+        if buffer != editor.text:
+            cursor = editor.cursor_location
+            scroll = editor.scroll_offset
+            editor.load_text(buffer)
+            if keep_cursor:
+                editor.move_cursor(cursor)
+                editor.scroll_to(scroll.x, scroll.y, animate=False)
+        editor.set_diff_lines(added, deleted)
 
     def _exit_edit_mode(self) -> None:
         self.query_one("#editor").display = False
@@ -749,7 +885,7 @@ class GitDiffApp(App):
             return
         _, filename = self.files[self._current_index]
         if edit_mode:
-            title = f" {filename}  [dim]^S Save  ^X Revert  ^G File List[/dim]"
+            title = f" {filename}  [dim]^S Save  ^X Revert  BS on red: Restore  ^G File List[/dim]"
         else:
             del_tag = "[green]on[/green]" if self._show_deleted else "[red]off[/red]"
             title = f" {filename}  [dim]e Edit  ^R Del:{del_tag}[dim]  ^G List[/dim][/dim]"

@@ -1,0 +1,31 @@
+ChangeBranchScreen {
+    align: center middle;
+}
+
+#dialog {
+    padding: 1 2;
+    width: 60;
+    height: auto;
+    border: thick $primary;
+    background: $surface;
+}
+
+#dialog-title {
+    text-align: center;
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+.branch-label {
+    padding-top: 1;
+}
+
+#button-row {
+    align-horizontal: right;
+    padding-top: 1;
+    height: 3;
+}
+
+Button {
+    margin-left: 1;
+}

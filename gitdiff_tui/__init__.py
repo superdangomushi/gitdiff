@@ -1,0 +1,1 @@
+"""Interactive Git diff viewer."""

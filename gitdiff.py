@@ -112,6 +112,14 @@ def get_file_stats(branch_a: str, branch_b: str) -> dict[str, tuple[str, str]]:
     return stats
 
 
+def get_unstaged_files() -> set[str]:
+    """Return paths with changes not yet staged (index vs working tree)."""
+    stdout, _, rc = run_git("diff", "--name-only")
+    if rc != 0:
+        return set()
+    return {line for line in stdout.splitlines() if line}
+
+
 def get_file_diff(branch_a: str, branch_b: str, filename: str) -> str:
     ref = [f"{branch_a}...{branch_b}"] if branch_b else [branch_a]
     stdout, _, _ = run_git("diff", *ref, "--", filename)
@@ -442,11 +450,14 @@ class DiffTextArea(TextArea):
         return Strip(new_segs, strip.cell_length)
 
 
-def _file_leaf_label(status: str, name: str, stats: tuple[str, str]) -> str:
+def _file_leaf_label(
+    status: str, name: str, stats: tuple[str, str], unstaged: bool = False
+) -> str:
     color, badge, _ = STATUS_STYLES.get(status, ("white", "[?]", "Unknown"))
     added, removed = stats
     stats_str = f"  [green]+{added}[/green] [red]-{removed}[/red]" if added != "-" else ""
-    return f"[{color}]{badge}[/{color}] {name}{stats_str}"
+    name_str = f"[yellow]{name}[/yellow]" if unstaged else name
+    return f"[{color}]{badge}[/{color}] {name_str}{stats_str}"
 
 
 class ChangeBranchScreen(ModalScreen):
@@ -636,6 +647,8 @@ class GitDiffApp(App):
         self._show_editor: bool = True
         self._files_editor_only: bool = False
         self._diff_lines: list[tuple[str, str, Optional[int]]] = []
+        self._unstaged: set[str] = set()
+        self._leaf_nodes: dict[int, TreeNode] = {}
 
     @property
     def _b_label(self) -> str:
@@ -645,7 +658,7 @@ class GitDiffApp(App):
         yield Header()
         with Horizontal():
             with Vertical(id="sidebar"):
-                yield Static(f" Files ({len(self.files)})", id="sidebar-title")
+                yield Static(self._sidebar_title(), id="sidebar-title")
                 tree: Tree[int] = Tree("Files", id="file-list")
                 tree.show_root = False
                 tree.guide_depth = 2
@@ -763,6 +776,8 @@ class GitDiffApp(App):
             self._render_diff(self._current_index)
             self._refresh_editor_view()
             self._load_editor_buffer(content, diff_text, keep_cursor=True)
+            self._refresh_unstaged()
+            self._update_leaf_label(self._current_index)
         except OSError as e:
             self.notify(f"Error saving: {e}", severity="error")
 
@@ -808,10 +823,32 @@ class GitDiffApp(App):
 
     # ---- internal helpers ----
 
+    def _refresh_unstaged(self) -> None:
+        # Only meaningful when comparing against the working tree.
+        self._unstaged = get_unstaged_files() if not self.branch_b else set()
+
+    def _sidebar_title(self) -> str:
+        title = f" Files ({len(self.files)})"
+        if not self.branch_b:
+            title += "  [dim][yellow]unstaged[/yellow][/dim]"
+        return title
+
+    def _update_leaf_label(self, index: int) -> None:
+        node = self._leaf_nodes.get(index)
+        if node is None:
+            return
+        status, filename = self.files[index]
+        stats = self.file_stats.get(filename, ("-", "-"))
+        node.set_label(_file_leaf_label(
+            status, filename.split("/")[-1], stats, filename in self._unstaged
+        ))
+
     def _build_file_tree(self, tree: Tree) -> None:
         """Populate the Tree widget with files grouped by folder."""
         tree.clear()
         tree.root.expand()
+        self._refresh_unstaged()
+        self._leaf_nodes = {}
         dir_nodes: dict[tuple[str, ...], TreeNode] = {(): tree.root}
 
         # Sort by path so siblings group together; keep original index for diff lookup.
@@ -828,7 +865,8 @@ class GitDiffApp(App):
                     )
             parent = dir_nodes[tuple(parts[:-1])]
             stats = self.file_stats.get(filename, ("-", "-"))
-            parent.add_leaf(_file_leaf_label(status, parts[-1], stats), data=orig_idx)
+            label = _file_leaf_label(status, parts[-1], stats, filename in self._unstaged)
+            self._leaf_nodes[orig_idx] = parent.add_leaf(label, data=orig_idx)
 
     def _first_leaf(self, node: TreeNode) -> Optional[TreeNode]:
         if node.allow_expand is False or not node.children:
@@ -915,7 +953,7 @@ class GitDiffApp(App):
 
     def _reload_file_list(self) -> None:
         self.title = f"gitdiff  {self.branch_a} → {self._b_label}  (on {get_current_branch()})"
-        self.query_one("#sidebar-title", Static).update(f" Files ({len(self.files)})")
+        self.query_one("#sidebar-title", Static).update(self._sidebar_title())
 
         tree = self.query_one("#file-list", Tree)
         self._build_file_tree(tree)
@@ -937,7 +975,8 @@ class GitDiffApp(App):
         status, filename = self.files[index]
         _, badge, desc = STATUS_STYLES.get(status, ("white", "[?]", "Unknown"))
         diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
-        self.query_one("#diff-title", Static).update(f" {badge} {filename}  [{desc}]")
+        unstaged_tag = "  [yellow](unstaged)[/yellow]" if filename in self._unstaged else ""
+        self.query_one("#diff-title", Static).update(f" {badge} {filename}  [{desc}]{unstaged_tag}")
         content = self.query_one("#diff-content", Static)
         if diff_text:
             content.update(

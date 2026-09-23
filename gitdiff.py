@@ -2,6 +2,7 @@
 """gitdiff - Interactive git branch diff viewer"""
 
 import argparse
+import difflib
 import os
 import re
 import subprocess
@@ -11,6 +12,7 @@ from typing import Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.geometry import Offset
 from textual.screen import ModalScreen
 from textual.strip import Strip
 from textual.widgets import (
@@ -191,6 +193,37 @@ def build_editor_view(
 _ADD_BG = RichStyle(bgcolor="dark_green")
 _DEL_BG = RichStyle(bgcolor="dark_red")
 
+_REMAP_DEBOUNCE = 0.1  # seconds to wait after a keystroke before re-anchoring
+
+
+def remap_line_indices(
+    old_lines: list[str],
+    new_lines: list[str],
+    indices: set[int],
+) -> set[int]:
+    """Carry 0-based line indices from ``old_lines`` over to ``new_lines``.
+
+    Lines that survived the edit keep their marker at the shifted position;
+    lines that were removed lose it.
+    """
+    if not indices:
+        return set()
+    if old_lines == new_lines:
+        return set(indices)
+
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    moved: set[int] = set()
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag not in ("equal", "replace"):
+            continue  # 'insert' has no old lines, 'delete' has no new ones
+        for i in indices:
+            if not i1 <= i < i2:
+                continue
+            j = j1 + (i - i1)
+            if j < j2:  # a shrinking 'replace' can drop the tail
+                moved.add(j)
+    return moved
+
 
 class DiffTextArea(TextArea):
     """TextArea that highlights added/deleted lines with green/red backgrounds."""
@@ -199,10 +232,16 @@ class DiffTextArea(TextArea):
         super().__init__(*args, **kwargs)
         self._added_lines: set[int] = set()   # 0-based line indices → green
         self._deleted_lines: set[int] = set() # 0-based line indices → red
+        self._anchor_lines: list[str] = []    # buffer contents the indices refer to
+        self._remap_timer = None
 
     def set_diff_lines(self, added: set[int], deleted: set[int]) -> None:
-        self._added_lines = added
-        self._deleted_lines = deleted
+        if self._remap_timer is not None:
+            self._remap_timer.stop()
+            self._remap_timer = None
+        self._added_lines = set(added)
+        self._deleted_lines = set(deleted)
+        self._anchor_lines = self.text.split("\n")
         self.refresh()
 
     def on_key(self, event) -> None:
@@ -216,9 +255,50 @@ class DiffTextArea(TextArea):
             event.prevent_default()
             self.app.action_exit_edit()
 
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """Re-anchor the highlights after the buffer is edited."""
+        if not self._added_lines and not self._deleted_lines:
+            return
+        if self._remap_timer is not None:
+            self._remap_timer.stop()
+        self._remap_timer = self.set_timer(_REMAP_DEBOUNCE, self._remap_diff_lines)
+
+    def _remap_diff_lines(self) -> None:
+        self._remap_timer = None
+        new_lines = self.text.split("\n")
+        if new_lines == self._anchor_lines:
+            return
+        self._added_lines = remap_line_indices(
+            self._anchor_lines, new_lines, self._added_lines
+        )
+        self._deleted_lines = remap_line_indices(
+            self._anchor_lines, new_lines, self._deleted_lines
+        )
+        self._anchor_lines = new_lines
+        self.refresh()
+
+    def _document_row(self, y: int) -> Optional[int]:
+        """Map a screen row to the document line it renders.
+
+        A soft-wrapped line occupies several screen rows, so the row index is
+        not the line index; ``scroll_offset`` is also the integer offset the
+        base widget actually renders with, unlike the animated ``scroll_y``.
+        """
+        y_offset = y + self.scroll_offset.y
+        if y_offset < 0:
+            return None
+        wrapped = getattr(self, "wrapped_document", None)
+        if wrapped is None:  # Textual too old to soft wrap: rows are lines
+            return y_offset if y_offset < self.document.line_count else None
+        if y_offset >= wrapped.height:
+            return None  # padding below the last line
+        return wrapped.offset_to_location(Offset(0, y_offset))[0]
+
     def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
-        doc_y = y + int(self.scroll_y)
+        doc_y = self._document_row(y)
+        if doc_y is None:
+            return strip
         if doc_y in self._added_lines:
             bg = _ADD_BG
         elif doc_y in self._deleted_lines:
@@ -544,7 +624,9 @@ class GitDiffApp(App):
             content = Path(filepath).read_text(encoding="utf-8")
         except OSError:
             content = ""
-        self.query_one("#editor", DiffTextArea).load_text(content)
+        editor = self.query_one("#editor", DiffTextArea)
+        editor.load_text(content)
+        editor.set_diff_lines(*self._compute_editor_highlights())
         self.notify(f"Reverted: {filename}")
 
     def action_change_branch(self) -> None:

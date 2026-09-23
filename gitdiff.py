@@ -3,14 +3,16 @@
 
 import argparse
 import difflib
+import json
 import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
-from textual import events
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.geometry import Offset
@@ -21,6 +23,9 @@ from textual.widgets import (
 )
 from textual.widgets.tree import TreeNode
 from textual.containers import Horizontal, Vertical, ScrollableContainer
+from rich.console import Group
+from rich.markdown import Markdown
+from rich.rule import Rule
 from rich.segment import Segment
 from rich.style import Style as RichStyle
 from rich.syntax import Syntax
@@ -135,20 +140,182 @@ def get_repo_root() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# GitHub PR review comments (via gh)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReviewComment:
+    author: str
+    body: str
+    created_at: str
+
+
+@dataclass
+class ReviewThread:
+    path: str
+    side: str             # 'RIGHT' (new file) | 'LEFT' (old file)
+    line: Optional[int]   # None when the thread is outdated
+    start_line: Optional[int]
+    resolved: bool
+    outdated: bool
+    diff_hunk: str
+    comments: list[ReviewComment] = field(default_factory=list)
+
+    @property
+    def lines(self) -> range:
+        if self.line is None:
+            return range(0)
+        return range(self.start_line or self.line, self.line + 1)
+
+
+_REVIEW_THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved isOutdated path line startLine diffSide
+          comments(first: 100) {
+            nodes { author { login } body createdAt diffHunk }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _run_gh(*args: str) -> Optional[str]:
+    try:
+        result = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _pr_head_branch(ref: str) -> str:
+    """Strip a remote prefix such as ``origin/`` from ``ref``."""
+    stdout, _, _ = run_git("remote")
+    for remote in stdout.split():
+        if ref.startswith(remote + "/"):
+            return ref[len(remote) + 1:]
+    return ref
+
+
+def get_pr_review_threads(head: str) -> Optional[tuple[int, dict[str, list[ReviewThread]]]]:
+    """Return (PR number, threads by path) for the PR opened from ``head``."""
+    out = _run_gh("pr", "view", _pr_head_branch(head), "--json", "number")
+    if out is None:
+        return None
+    number = json.loads(out)["number"]
+    out = _run_gh(
+        "api", "graphql",
+        "-F", "owner={owner}", "-F", "name={repo}", "-F", f"number={number}",
+        "-f", f"query={_REVIEW_THREADS_QUERY}",
+    )
+    if out is None:
+        return None
+    nodes = json.loads(out)["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    threads: dict[str, list[ReviewThread]] = {}
+    for node in nodes:
+        comments = [
+            ReviewComment(
+                author=(c.get("author") or {}).get("login", "ghost"),
+                body=c.get("body", ""),
+                created_at=c.get("createdAt", ""),
+            )
+            for c in node["comments"]["nodes"]
+        ]
+        first = node["comments"]["nodes"][0] if node["comments"]["nodes"] else {}
+        threads.setdefault(node["path"], []).append(ReviewThread(
+            path=node["path"],
+            side=node.get("diffSide") or "RIGHT",
+            line=node.get("line"),
+            start_line=node.get("startLine"),
+            resolved=node.get("isResolved", False),
+            outdated=node.get("isOutdated", False),
+            diff_hunk=first.get("diffHunk", ""),
+            comments=comments,
+        ))
+    return number, threads
+
+
+def render_review_threads(threads: list["ReviewThread"]) -> Group:
+    parts = []
+    for thread in threads:
+        where = f"{thread.path}:{thread.line}"
+        tags = ""
+        if thread.resolved:
+            tags += "  [green](resolved)[/green]"
+        if thread.outdated:
+            tags += "  [dim](outdated)[/dim]"
+        parts.append(RichText.from_markup(f"[bold yellow]{where}[/bold yellow]{tags}"))
+        hunk = "\n".join(thread.diff_hunk.splitlines()[-4:])
+        if hunk:
+            parts.append(Syntax(hunk, "diff", theme="monokai", word_wrap=True))
+        for comment in thread.comments:
+            date = comment.created_at.replace("T", " ").rstrip("Z")
+            parts.append(RichText.from_markup(
+                f"\n[bold cyan]@{comment.author}[/bold cyan]  [dim]{date}[/dim]"
+            ))
+            parts.append(Markdown(comment.body))
+        parts.append(Rule(style="dim"))
+    return Group(*parts)
+
+
+# ---------------------------------------------------------------------------
 # Diff parsing & rendering
 # ---------------------------------------------------------------------------
 
-def _hunk_new_offset(header: str, default: int) -> int:
-    """Return the number of new-file lines that precede a hunk.
+def _hunk_offset(header: str, default: int, sign: str = "+") -> int:
+    """Return the number of new-file (``sign='+'``) or old-file (``'-'``)
+    lines that precede a hunk.
 
     ``@@ -a,b +c,d @@`` starts at line ``c``, except that an empty new range
     (``d == 0``) names the line the hunk comes *after*.
     """
-    m = re.search(r"\+(\d+)(?:,(\d+))?", header)
+    m = re.search(re.escape(sign) + r"(\d+)(?:,(\d+))?", header)
     if not m:
         return default
     start = int(m.group(1))
     return start if m.group(2) == "0" else start - 1
+
+
+def _hunk_new_offset(header: str, default: int) -> int:
+    return _hunk_offset(header, default, "+")
+
+
+def walk_diff(diff_text: str) -> Iterator[tuple[str, str, Optional[int], Optional[int]]]:
+    """Yield (kind, content, old_lineno, new_lineno) for every hunk line.
+
+    kind: 'add' | 'del' | 'ctx'. Line numbers are 1-based; the side a line
+    does not exist on is None.
+    """
+    old_lineno = new_lineno = 0
+    in_hunk = False
+
+    for line in diff_text.splitlines():
+        if line.startswith(("diff ", "index ", "--- ", "+++ ")):
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            old_lineno = _hunk_offset(line, old_lineno, "-")
+            new_lineno = _hunk_offset(line, new_lineno, "+")
+            in_hunk = True
+            continue
+        if not in_hunk or line.startswith("\\"):
+            continue
+        if line.startswith("+"):
+            new_lineno += 1
+            yield "add", line[1:], None, new_lineno
+        elif line.startswith("-"):
+            old_lineno += 1
+            yield "del", line[1:], old_lineno, None
+        else:  # context line (starts with space)
+            old_lineno += 1
+            new_lineno += 1
+            yield "ctx", line[1:], old_lineno, new_lineno
 
 
 def parse_diff_lines(diff_text: str) -> list[tuple[str, str, Optional[int]]]:
@@ -157,29 +324,47 @@ def parse_diff_lines(diff_text: str) -> list[tuple[str, str, Optional[int]]]:
     kind     : 'add' | 'del' | 'ctx'
     new_lineno: 1-based line number in the new file; None for deleted lines.
     """
-    result: list[tuple[str, str, Optional[int]]] = []
-    new_lineno = 0
-    in_hunk = False
+    return [(kind, content, new) for kind, content, _old, new in walk_diff(diff_text)]
 
-    for line in diff_text.splitlines():
-        if line.startswith(("diff ", "index ", "--- ", "+++ ")):
-            in_hunk = False
-            continue
-        if line.startswith("@@"):
-            new_lineno = _hunk_new_offset(line, new_lineno)
-            in_hunk = True
-            continue
-        if not in_hunk or line.startswith("\\"):
-            continue
-        if line.startswith("+"):
-            new_lineno += 1
-            result.append(("add", line[1:], new_lineno))
-        elif line.startswith("-"):
-            result.append(("del", line[1:], None))
-        else:  # context line (starts with space)
-            new_lineno += 1
-            result.append(("ctx", line[1:], new_lineno))
 
+def map_threads_to_diff(
+    diff_text: str, threads: list["ReviewThread"]
+) -> dict[int, list["ReviewThread"]]:
+    """Map indices into ``parse_diff_lines(diff_text)`` to the threads on them."""
+    right: dict[int, list[ReviewThread]] = {}
+    left: dict[int, list[ReviewThread]] = {}
+    for thread in threads:
+        target = left if thread.side == "LEFT" else right
+        for ln in thread.lines:
+            target.setdefault(ln, []).append(thread)
+    result: dict[int, list[ReviewThread]] = {}
+    for i, (kind, _content, old, new) in enumerate(walk_diff(diff_text)):
+        found = left.get(old, []) if kind == "del" else right.get(new, [])
+        if found:
+            result[i] = found
+    return result
+
+
+def map_threads_to_buffer(
+    diff_text: str, deleted: set[int], line_count: int, threads: list["ReviewThread"]
+) -> dict[int, list["ReviewThread"]]:
+    """Map edit-buffer line indices (see ``build_edit_buffer``) to threads."""
+    old_of_deleted = [old for kind, _c, old, _n in walk_diff(diff_text) if kind == "del"]
+    deleted_rows = sorted(deleted)
+    file_rows = [i for i in range(line_count) if i not in deleted]
+    result: dict[int, list[ReviewThread]] = {}
+    for thread in threads:
+        for ln in thread.lines:
+            row: Optional[int] = None
+            if thread.side == "LEFT":
+                if ln in old_of_deleted:
+                    k = old_of_deleted.index(ln)
+                    if k < len(deleted_rows):
+                        row = deleted_rows[k]
+            elif 0 < ln <= len(file_rows):
+                row = file_rows[ln - 1]
+            if row is not None:
+                result.setdefault(row, []).append(thread)
     return result
 
 
@@ -254,17 +439,23 @@ def build_edit_buffer(
 def build_editor_view(
     diff_lines: list[tuple[str, str, Optional[int]]],
     show_deleted: bool,
+    commented: frozenset[int] | set[int] = frozenset(),
 ) -> RichText:
-    """Build Rich Text with green/red diff highlights and line numbers."""
+    """Build Rich Text with green/red diff highlights and line numbers.
+
+    Lines whose index is in ``commented`` (PR review comments) are yellow.
+    """
     text = RichText()
     line_nums = [ln for _, _, ln in diff_lines if ln is not None]
     width = len(str(max(line_nums))) if line_nums else 1
 
-    for kind, content, lineno in diff_lines:
+    for i, (kind, content, lineno) in enumerate(diff_lines):
         if kind == "del" and not show_deleted:
             continue
         gutter = f"{lineno:>{width}} " if lineno is not None else f"{'~':>{width}} "
-        if kind == "add":
+        if i in commented:
+            text.append(gutter + content + "\n", style=_COMMENT_STYLE)
+        elif kind == "add":
             text.append(gutter + content + "\n", style="on dark_green")
         elif kind == "del":
             text.append(gutter + content + "\n", style="on dark_red")
@@ -280,6 +471,8 @@ def build_editor_view(
 
 _ADD_BG = RichStyle(bgcolor="dark_green")
 _DEL_BG = RichStyle(bgcolor="dark_red")
+_COMMENT_STYLE = "black on yellow"
+_COMMENT_BG = RichStyle(color="black", bgcolor="yellow")
 
 _REMAP_DEBOUNCE = 0.1  # seconds to wait after a keystroke before re-anchoring
 
@@ -325,6 +518,7 @@ class DiffTextArea(TextArea):
         self._added_lines: set[int] = set()   # 0-based line indices → green
         self._deleted_lines: set[int] = set() # 0-based line indices → red
         self._anchor_lines: list[str] = []    # buffer contents the indices refer to
+        self._comment_rows: dict[int, list[ReviewThread]] = {}  # → yellow, clickable
         self._remap_timer = None
 
     def set_diff_lines(self, added: set[int], deleted: set[int]) -> None:
@@ -335,6 +529,23 @@ class DiffTextArea(TextArea):
         self._deleted_lines = set(deleted)
         self._anchor_lines = self.text.split("\n")
         self.refresh()
+
+    def set_comment_rows(self, rows: dict[int, list["ReviewThread"]]) -> None:
+        """Set comment rows; call right after ``set_diff_lines`` (same anchor)."""
+        self._comment_rows = dict(rows)
+        self.refresh()
+
+    def on_click(self, event: events.Click) -> None:
+        """Clicking a commented (yellow) line shows its review threads."""
+        if not self._comment_rows:
+            return
+        offset = event.get_content_offset(self)
+        if offset is None:
+            return
+        self._sync_diff_lines()
+        row = self._document_row(offset.y)
+        if row in self._comment_rows:
+            self.app.show_review_threads(self._comment_rows[row])
 
     def on_key(self, event) -> None:
         """Capture Tab for indentation and Escape to exit edit mode."""
@@ -350,7 +561,7 @@ class DiffTextArea(TextArea):
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         """Re-anchor the highlights after the buffer is edited."""
-        if not self._added_lines and not self._deleted_lines:
+        if not self._added_lines and not self._deleted_lines and not self._comment_rows:
             return
         if self._remap_timer is not None:
             self._remap_timer.stop()
@@ -413,6 +624,11 @@ class DiffTextArea(TextArea):
         self._deleted_lines = remap_line_indices(
             self._anchor_lines, new_lines, self._deleted_lines
         )
+        comment_rows: dict[int, list[ReviewThread]] = {}
+        for row, threads in self._comment_rows.items():
+            for new_row in remap_line_indices(self._anchor_lines, new_lines, {row}):
+                comment_rows[new_row] = threads
+        self._comment_rows = comment_rows
         self._anchor_lines = new_lines
         self.refresh()
 
@@ -438,7 +654,9 @@ class DiffTextArea(TextArea):
         doc_y = self._document_row(y)
         if doc_y is None:
             return strip
-        if doc_y in self._added_lines:
+        if doc_y in self._comment_rows:
+            bg = _COMMENT_BG
+        elif doc_y in self._added_lines:
             bg = _ADD_BG
         elif doc_y in self._deleted_lines:
             bg = _DEL_BG
@@ -451,14 +669,29 @@ class DiffTextArea(TextArea):
         return Strip(new_segs, strip.cell_length)
 
 
+class EditorView(Static):
+    """Read-only diff view; clicking a yellow (commented) line opens its threads."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.row_threads: dict[int, list[ReviewThread]] = {}
+
+    def on_click(self, event: events.Click) -> None:
+        offset = event.get_content_offset(self)
+        if offset is not None and offset.y in self.row_threads:
+            self.app.show_review_threads(self.row_threads[offset.y])
+
+
 def _file_leaf_label(
-    status: str, name: str, stats: tuple[str, str], unstaged: bool = False
+    status: str, name: str, stats: tuple[str, str], unstaged: bool = False,
+    comments: int = 0,
 ) -> str:
     color, badge, _ = STATUS_STYLES.get(status, ("white", "[?]", "Unknown"))
     added, removed = stats
     stats_str = f"  [green]+{added}[/green] [red]-{removed}[/red]" if added != "-" else ""
     name_str = f"[yellow]{name}[/yellow]" if unstaged else name
-    return f"[{color}]{badge}[/{color}] {name_str}{stats_str}"
+    comment_str = f"  [black on yellow] {comments} [/black on yellow]" if comments else ""
+    return f"[{color}]{badge}[/{color}] {name_str}{stats_str}{comment_str}"
 
 
 class PanelSplitter(Static):
@@ -637,6 +870,16 @@ class GitDiffApp(App):
         width: auto;
     }
 
+    #comment-scroll {
+        height: 1fr;
+        overflow-y: auto;
+        display: none;
+    }
+
+    #comment-content {
+        padding: 0 1;
+    }
+
     #editor-panel {
         width: 1fr;
     }
@@ -680,7 +923,7 @@ class GitDiffApp(App):
         Binding("ctrl+f", "toggle_files_editor", "Files+Editor", priority=True),
         Binding("ctrl+s", "write_out",       "Write Out",    priority=True),
         Binding("ctrl+x", "revert_file",     "Revert",       priority=True),
-        Binding("escape", "exit_edit",        "Exit Edit",    priority=True),
+        Binding("escape", "exit_edit",        "Back",         priority=True),
         Binding("ctrl+g", "focus_list",      "File List",    priority=True),
     ]
 
@@ -698,6 +941,10 @@ class GitDiffApp(App):
         self._diff_lines: list[tuple[str, str, Optional[int]]] = []
         self._unstaged: set[str] = set()
         self._leaf_nodes: dict[int, TreeNode] = {}
+        self._pr_number: Optional[int] = None
+        self._pr_threads: dict[str, list[ReviewThread]] = {}
+        # Index into self._diff_lines → review threads on that line
+        self._diff_threads: dict[int, list[ReviewThread]] = {}
 
     @property
     def _b_label(self) -> str:
@@ -716,11 +963,13 @@ class GitDiffApp(App):
                 yield Static(f" {self.branch_a}  →  {self._b_label}", id="diff-title")
                 with ScrollableContainer(id="diff-scroll"):
                     yield Static("← Select a file", id="diff-content")
+                with ScrollableContainer(id="comment-scroll"):
+                    yield Static("", id="comment-content")
             yield PanelSplitter("diff-panel", "editor-panel", id="panel-splitter")
             with Vertical(id="editor-panel"):
                 yield Static(" Editor", id="editor-title")
                 with ScrollableContainer(id="editor-view-scroll"):
-                    yield Static("← Select a file", id="editor-view")
+                    yield EditorView("← Select a file", id="editor-view")
                 yield DiffTextArea("", id="editor", show_line_numbers=True)
         yield Footer()
 
@@ -734,6 +983,7 @@ class GitDiffApp(App):
             tree.move_cursor(first_leaf)
             self._current_index = first_leaf.data
             self._load_file(first_leaf.data)
+        self._fetch_review_threads()
 
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
         data = event.node.data
@@ -759,7 +1009,9 @@ class GitDiffApp(App):
         self._page_scroll_target().scroll_page_up()
 
     def action_exit_edit(self) -> None:
-        if self.query_one("#editor").display:
+        if self.query_one("#comment-scroll").display:
+            self._close_review_threads()
+        elif self.query_one("#editor").display:
             self._exit_edit_mode()
 
     def action_focus_list(self) -> None:
@@ -824,7 +1076,7 @@ class GitDiffApp(App):
             self.notify(f"Saved: {filename}")
             # Refresh diff, view, and editor highlights after save
             diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
-            self._diff_lines = parse_diff_lines(diff_text)
+            self._set_diff(filename, diff_text)
             self._render_diff(self._current_index)
             self._refresh_editor_view()
             self._load_editor_buffer(content, diff_text, keep_cursor=True)
@@ -869,9 +1121,71 @@ class GitDiffApp(App):
             self.files = files
             self.file_stats = stats
             self._current_index = 0
+            self._pr_threads = {}
             self._reload_file_list()
+            self._fetch_review_threads()
 
         self.push_screen(ChangeBranchScreen(self.branch_a, self.branch_b), on_dismiss)
+
+    # ---- PR review comments ----
+
+    @work(thread=True, exclusive=True, group="pr-comments")
+    def _fetch_review_threads(self) -> None:
+        head = self.branch_b or get_current_branch()
+        result = get_pr_review_threads(head)
+        if result is not None:
+            self.call_from_thread(self._apply_review_threads, head, *result)
+
+    def _apply_review_threads(
+        self, head: str, number: int, threads: dict[str, list[ReviewThread]]
+    ) -> None:
+        if head != (self.branch_b or get_current_branch()):
+            return  # branches changed while fetching
+        self._pr_number = number
+        self._pr_threads = threads
+        for index in self._leaf_nodes:
+            self._update_leaf_label(index)
+        total = sum(len(t) for t in threads.values())
+        self.notify(f"PR #{number}: {total} review thread(s)")
+        if not self.files:
+            return
+        _, filename = self.files[self._current_index]
+        diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
+        if self._diff_lines:
+            self._set_diff(filename, diff_text)
+            self._refresh_editor_view()
+        editor = self.query_one("#editor", DiffTextArea)
+        if editor.display:
+            editor.set_comment_rows(map_threads_to_buffer(
+                diff_text, editor._deleted_lines, editor.document.line_count,
+                self._pr_threads.get(filename, []),
+            ))
+
+    def show_review_threads(self, threads: list[ReviewThread]) -> None:
+        """Show ``threads`` in place of the diff summary (Esc to go back)."""
+        self.query_one("#comment-content", Static).update(render_review_threads(threads))
+        self.query_one("#diff-scroll").display = False
+        scroll = self.query_one("#comment-scroll", ScrollableContainer)
+        scroll.display = True
+        scroll.scroll_home(animate=False)
+        count = sum(len(t.comments) for t in threads)
+        pr = f"PR #{self._pr_number}  " if self._pr_number else ""
+        self.query_one("#diff-title", Static).update(
+            f" {pr}[yellow]{count} comment(s)[/yellow]  [dim]Esc Back[/dim]"
+        )
+        # Ctrl+F hides the diff panel; bring it back while the comments are open.
+        self.query_one("#diff-panel").display = True
+        self._update_splitter()
+
+    def _close_review_threads(self) -> None:
+        if not self.query_one("#comment-scroll").display:
+            return
+        self.query_one("#comment-scroll").display = False
+        self.query_one("#diff-scroll").display = True
+        self.query_one("#diff-panel").display = not self._files_editor_only
+        self._update_splitter()
+        if self.files:
+            self._render_diff(self._current_index)
 
     # ---- internal helpers ----
 
@@ -898,7 +1212,8 @@ class GitDiffApp(App):
         status, filename = self.files[index]
         stats = self.file_stats.get(filename, ("-", "-"))
         node.set_label(_file_leaf_label(
-            status, filename.split("/")[-1], stats, filename in self._unstaged
+            status, filename.split("/")[-1], stats, filename in self._unstaged,
+            len(self._pr_threads.get(filename, [])),
         ))
 
     def _build_file_tree(self, tree: Tree) -> None:
@@ -923,7 +1238,10 @@ class GitDiffApp(App):
                     )
             parent = dir_nodes[tuple(parts[:-1])]
             stats = self.file_stats.get(filename, ("-", "-"))
-            label = _file_leaf_label(status, parts[-1], stats, filename in self._unstaged)
+            label = _file_leaf_label(
+                status, parts[-1], stats, filename in self._unstaged,
+                len(self._pr_threads.get(filename, [])),
+            )
             self._leaf_nodes[orig_idx] = parent.add_leaf(label, data=orig_idx)
 
     def _first_leaf(self, node: TreeNode) -> Optional[TreeNode]:
@@ -967,15 +1285,27 @@ class GitDiffApp(App):
                 editor.move_cursor(cursor)
                 editor.scroll_to(scroll.x, scroll.y, animate=False)
         editor.set_diff_lines(added, deleted)
+        _, filename = self.files[self._current_index]
+        editor.set_comment_rows(map_threads_to_buffer(
+            diff_text, deleted, editor.document.line_count,
+            self._pr_threads.get(filename, []),
+        ))
 
     def _exit_edit_mode(self) -> None:
         self.query_one("#editor").display = False
         self.query_one("#editor-view-scroll").display = True
         self._update_editor_title(edit_mode=False)
 
+    def _set_diff(self, filename: str, diff_text: str) -> None:
+        self._diff_lines = parse_diff_lines(diff_text)
+        self._diff_threads = map_threads_to_diff(diff_text, self._pr_threads.get(filename, []))
+
     def _load_file(self, index: int) -> None:
+        self._close_review_threads()
         self._render_diff(index)
         status, filename = self.files[index]
+        self._diff_threads = {}
+        self.query_one("#editor-view", EditorView).row_threads = {}
         if status == "D" or self._repo_root is None:
             self._diff_lines = []
             self.query_one("#editor-view", Static).update("[dim](deleted file)[/dim]")
@@ -987,14 +1317,24 @@ class GitDiffApp(App):
             self.query_one("#editor-view", Static).update("[dim](no diff available)[/dim]")
             self.query_one("#editor-title", Static).update(f" Editor  [dim]{filename}[/dim]")
             return
-        self._diff_lines = parse_diff_lines(diff_text)
+        self._set_diff(filename, diff_text)
         self._refresh_editor_view()
         self._update_editor_title()
 
     def _refresh_editor_view(self) -> None:
-        view = self.query_one("#editor-view", Static)
+        view = self.query_one("#editor-view", EditorView)
         if self._diff_lines:
-            view.update(build_editor_view(self._diff_lines, self._show_deleted))
+            view.update(build_editor_view(
+                self._diff_lines, self._show_deleted, set(self._diff_threads)
+            ))
+            visible = [
+                i for i, (kind, _c, _n) in enumerate(self._diff_lines)
+                if kind != "del" or self._show_deleted
+            ]
+            view.row_threads = {
+                row: self._diff_threads[i]
+                for row, i in enumerate(visible) if i in self._diff_threads
+            }
         else:
             view.update("[dim]No diff data available.[/dim]")
 
@@ -1034,7 +1374,10 @@ class GitDiffApp(App):
         _, badge, desc = STATUS_STYLES.get(status, ("white", "[?]", "Unknown"))
         diff_text = get_file_diff(self.branch_a, self.branch_b, filename)
         unstaged_tag = "  [yellow](unstaged)[/yellow]" if filename in self._unstaged else ""
-        self.query_one("#diff-title", Static).update(f" {badge} {filename}  [{desc}]{unstaged_tag}")
+        if not self.query_one("#comment-scroll").display:
+            self.query_one("#diff-title", Static).update(
+                f" {badge} {filename}  [{desc}]{unstaged_tag}"
+            )
         content = self.query_one("#diff-content", Static)
         if diff_text:
             content.update(

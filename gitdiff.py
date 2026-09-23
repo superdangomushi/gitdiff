@@ -617,6 +617,7 @@ class GitDiffApp(App):
         ("b",      "change_branch",  "Branch"),
         Binding("ctrl+r", "toggle_deleted",  "Del Lines",    priority=True),
         Binding("ctrl+p", "toggle_editor",   "Editor Panel", priority=True),
+        Binding("ctrl+f", "toggle_files_editor", "Files+Editor", priority=True),
         Binding("ctrl+s", "write_out",       "Write Out",    priority=True),
         Binding("ctrl+x", "revert_file",     "Revert",       priority=True),
         Binding("escape", "exit_edit",        "Exit Edit",    priority=True),
@@ -633,6 +634,7 @@ class GitDiffApp(App):
         self._repo_root: Optional[str] = get_repo_root()
         self._show_deleted: bool = True
         self._show_editor: bool = True
+        self._files_editor_only: bool = False
         self._diff_lines: list[tuple[str, str, Optional[int]]] = []
 
     @property
@@ -682,11 +684,16 @@ class GitDiffApp(App):
     def action_move_up(self) -> None:
         self.query_one("#file-list", Tree).action_cursor_up()
 
+    def _page_scroll_target(self) -> ScrollableContainer:
+        # With the diff panel hidden, page keys scroll the editor view instead
+        target = "#editor-view-scroll" if self._files_editor_only else "#diff-scroll"
+        return self.query_one(target, ScrollableContainer)
+
     def action_page_down(self) -> None:
-        self.query_one("#diff-scroll", ScrollableContainer).scroll_page_down()
+        self._page_scroll_target().scroll_page_down()
 
     def action_page_up(self) -> None:
-        self.query_one("#diff-scroll", ScrollableContainer).scroll_page_up()
+        self._page_scroll_target().scroll_page_up()
 
     def action_exit_edit(self) -> None:
         if self.query_one("#editor").display:
@@ -707,10 +714,25 @@ class GitDiffApp(App):
 
     def action_toggle_editor(self) -> None:
         self._show_editor = not self._show_editor
+        if self._files_editor_only:
+            self.notify(f"Editor panel: {'on' if self._show_editor else 'off'} (after ^F)")
+            return
         panel = self.query_one("#editor-panel")
         panel.display = self._show_editor
         if not self._show_editor:
             # If hiding while in edit mode, exit edit mode first
+            if self.query_one("#editor").display:
+                self._exit_edit_mode()
+            self.query_one("#file-list", Tree).focus()
+
+    def action_toggle_files_editor(self) -> None:
+        """Show only the file list and editor panel, hiding the diff panel."""
+        self._files_editor_only = not self._files_editor_only
+        self.query_one("#diff-panel").display = not self._files_editor_only
+        # The editor panel is always visible in this mode; restore ^P state on exit
+        panel = self.query_one("#editor-panel")
+        panel.display = self._files_editor_only or self._show_editor
+        if not panel.display:
             if self.query_one("#editor").display:
                 self._exit_edit_mode()
             self.query_one("#file-list", Tree).focus()
@@ -957,6 +979,7 @@ def main() -> None:
             "  e        enter edit mode    Ctrl+G    back to file list\n"
             "  Ctrl+S   save file          Ctrl+X    revert file\n"
             "  Ctrl+R   toggle deleted     Ctrl+P    toggle editor panel\n"
+            "  Ctrl+F   toggle files + editor only view\n"
             "  b        change branches\n"
             "  q        quit"
         ),

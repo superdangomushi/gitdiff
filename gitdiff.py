@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.geometry import Offset
@@ -460,6 +461,45 @@ def _file_leaf_label(
     return f"[{color}]{badge}[/{color}] {name_str}{stats_str}"
 
 
+class PanelSplitter(Static):
+    """Draggable vertical bar that resizes the diff and editor panels."""
+
+    MIN_WIDTH = 10
+
+    def __init__(self, left_id: str, right_id: str, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._left_id = left_id
+        self._right_id = right_id
+        self._dragging = False
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self._dragging = True
+        self.add_class("-dragging")
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if not self._dragging:
+            return
+        left = self.app.query_one(f"#{self._left_id}")
+        right = self.app.query_one(f"#{self._right_id}")
+        start = left.region.x
+        total = right.region.right - start - self.region.width
+        if total <= self.MIN_WIDTH * 2:
+            return
+        width = max(self.MIN_WIDTH, min(event.screen_x - start, total - self.MIN_WIDTH))
+        left.styles.width = f"{width}fr"
+        right.styles.width = f"{total - width}fr"
+        event.stop()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._dragging:
+            self._dragging = False
+            self.remove_class("-dragging")
+            self.release_mouse()
+            event.stop()
+
+
 class ChangeBranchScreen(ModalScreen):
     """Modal screen for changing comparison branches."""
 
@@ -567,7 +607,16 @@ class GitDiffApp(App):
 
     #diff-panel {
         width: 1fr;
-        border-right: solid $primary-darken-2;
+    }
+
+    #panel-splitter {
+        width: 1;
+        height: 1fr;
+        background: $primary-darken-2;
+    }
+
+    #panel-splitter:hover, #panel-splitter.-dragging {
+        background: $accent;
     }
 
     #diff-title {
@@ -667,6 +716,7 @@ class GitDiffApp(App):
                 yield Static(f" {self.branch_a}  →  {self._b_label}", id="diff-title")
                 with ScrollableContainer(id="diff-scroll"):
                     yield Static("← Select a file", id="diff-content")
+            yield PanelSplitter("diff-panel", "editor-panel", id="panel-splitter")
             with Vertical(id="editor-panel"):
                 yield Static(" Editor", id="editor-title")
                 with ScrollableContainer(id="editor-view-scroll"):
@@ -732,6 +782,7 @@ class GitDiffApp(App):
             return
         panel = self.query_one("#editor-panel")
         panel.display = self._show_editor
+        self._update_splitter()
         if not self._show_editor:
             # If hiding while in edit mode, exit edit mode first
             if self.query_one("#editor").display:
@@ -745,6 +796,7 @@ class GitDiffApp(App):
         # The editor panel is always visible in this mode; restore ^P state on exit
         panel = self.query_one("#editor-panel")
         panel.display = self._files_editor_only or self._show_editor
+        self._update_splitter()
         if not panel.display:
             if self.query_one("#editor").display:
                 self._exit_edit_mode()
@@ -822,6 +874,12 @@ class GitDiffApp(App):
         self.push_screen(ChangeBranchScreen(self.branch_a, self.branch_b), on_dismiss)
 
     # ---- internal helpers ----
+
+    def _update_splitter(self) -> None:
+        # The splitter only makes sense while both the diff and editor panels are shown.
+        self.query_one("#panel-splitter").display = (
+            self.query_one("#diff-panel").display and self.query_one("#editor-panel").display
+        )
 
     def _refresh_unstaged(self) -> None:
         # Only meaningful when comparing against the working tree.

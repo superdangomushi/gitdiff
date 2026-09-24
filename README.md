@@ -104,7 +104,7 @@ gitdiff main feat/new-feature
 gitdiff.py                     # 既存の起動口（インストーラもここを呼ぶ）
 gitdiff_tui/
 ├── cli.py                     # 引数・補完・起動前のチェック
-├── app.py                     # GitDiffApp：状態管理、操作と各部品の連携
+├── app.py                     # GitDiffApp：状態・キー割り当て・画面構成
 ├── git.py                     # Git コマンド、差分・ブランチ情報の取得
 ├── github.py                  # gh による PR レビューコメント取得
 ├── models.py                  # ReviewComment / ReviewThread のデータ定義
@@ -112,6 +112,13 @@ gitdiff_tui/
 ├── review_mapping.py          # コメントと差分・編集行の対応付け
 ├── rendering.py               # Rich による表示内容、ステータス色・ラベル
 ├── languages.py               # 拡張子とハイライト言語の対応
+├── controllers/               # GitDiffApp の処理を責務ごとに分けた Mixin
+│   ├── navigation.py          # カーソル移動、スクロール、フォーカス
+│   ├── layout.py              # パネルの表示切替、スプリッター
+│   ├── file_list.py           # ファイルツリー構築、ブランチ変更
+│   ├── diff_view.py           # 差分・エディタプレビューの描画
+│   ├── editing.py             # 編集モード、保存、元に戻す
+│   └── review.py              # PR レビューコメントの取得・表示
 ├── widgets/
 │   ├── panels.py              # FilePanel / DiffPanel / EditorPanel の構成
 │   ├── file_tree.py           # FileTree：ディレクトリ表示、ファイルラベル
@@ -126,7 +133,7 @@ gitdiff_tui/
 tests/                         # 差分処理と画面操作の回帰テスト
 ```
 
-ファイル選択時は、`app.py` が `git.py` から差分を取得し、`diff.py` と `review_mapping.py` で表示用データを作り、画面部品を更新します。編集時の削除行の扱いは `widgets/editor.py`、保存先への書き込みは `app.py` が担当します。
+ファイル選択時は、`controllers/diff_view.py` が `git.py` から差分を取得し、`diff.py` と `review_mapping.py` で表示用データを作り、画面部品を更新します。編集時の削除行の扱いは `widgets/editor.py`、保存先への書き込みは `controllers/editing.py` が担当します。
 
 パネルの配置・構成を変える場合は `widgets/panels.py`、配色や幅を変える場合は `styles/`、キー操作を追加する場合は `app.py` の `BINDINGS` と `action_*` を編集します。
 

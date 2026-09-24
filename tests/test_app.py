@@ -21,14 +21,19 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(directory.cleanup)
         self.file = Path(directory.name) / "file.txt"
         self.file.write_text("first\nnew\nlast\n")
-        for name, value in {
-            "get_repo_root": directory.name,
-            "get_current_branch": "feature",
-            "get_unstaged_files": {"file.txt"},
-            "get_file_diff": DIFF,
-            "get_pr_review_threads": None,
+        # Each name is imported into every module that uses it, so patch it there.
+        for target, value in {
+            "app.get_repo_root": directory.name,
+            "app.get_current_branch": "feature",
+            "controllers.file_list.get_current_branch": "feature",
+            "controllers.review.get_current_branch": "feature",
+            "controllers.file_list.get_unstaged_files": {"file.txt"},
+            "controllers.diff_view.get_file_diff": DIFF,
+            "controllers.editing.get_file_diff": DIFF,
+            "controllers.review.get_file_diff": DIFF,
+            "controllers.review.get_pr_review_threads": None,
         }.items():
-            patcher = patch(f"gitdiff_tui.app.{name}", return_value=value)
+            patcher = patch(f"gitdiff_tui.{target}", return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
         self.app = GitDiffApp("main", "", [("M", "file.txt")], {"file.txt": ("1", "1")})
@@ -87,9 +92,9 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
             self.app.screen.query_one("#input-a", Input).value = "base"
             self.app.screen.query_one("#input-b", Input).value = "target"
             with (
-                patch("gitdiff_tui.app.check_ref", return_value=True),
-                patch("gitdiff_tui.app.get_diff_files", return_value=([], None)),
-                patch("gitdiff_tui.app.get_file_stats", return_value={}),
+                patch("gitdiff_tui.controllers.file_list.check_ref", return_value=True),
+                patch("gitdiff_tui.controllers.file_list.get_diff_files", return_value=([], None)),
+                patch("gitdiff_tui.controllers.file_list.get_file_stats", return_value={}),
             ):
                 await pilot.click("#btn-apply")
                 await pilot.pause()
